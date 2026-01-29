@@ -409,7 +409,3 @@ Potential improvements:
 - Historical path performance tracking
 - Integration with AWS Global Accelerator
 - Support for custom region endpoints
-
-## License
-
-This project is provided as-is for educational and development purposes.
