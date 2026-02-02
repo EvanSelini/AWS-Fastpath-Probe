@@ -145,7 +145,7 @@ You need a service listening on the destination host in Region Y. The applicatio
 
 #### Option A: Netcat (Simple TCP/UDP Testing)
 
-**Important**: The application makes multiple connections per port (controlled by `--test-count`, default: 5). For TCP, use the `-k` (keep listening) flag so netcat continues accepting connections after each one closes. **Note: UDP netcat does not support the `-k` flag**, so you must use a loop for UDP testing.
+**Important**: The application makes multiple connections per port (controlled by `--test-count`, default: 5). Use the `-k` (keep listening) flag so netcat continues accepting connections after each one closes. For UDP, the `-k` flag requires the `--sh-exec` option to handle each connection.
 
 **For TCP testing:**
 ```bash
@@ -162,12 +162,12 @@ nc -l -k -p 8080 -s <target_ip>
 
 **For UDP testing:**
 ```bash
-# UDP netcat does NOT support the -k flag, so use a loop instead
-# On Region Y host, listen on UDP port 53 (Linux)
-while true; do nc -u -l -p 53; done
+# On Region Y host, listen on UDP port 8080 (Linux)
+# The -k flag with --sh-exec keeps netcat listening after each connection
+nc -u -l 8080 -k --sh-exec 'timeout 1 cat'
 
-# macOS syntax
-while true; do nc -u -l 53; done
+# macOS syntax (may vary - check your netcat version)
+nc -u -l 8080 -k --sh-exec 'timeout 1 cat'
 ```
 
 **Note**: If your system doesn't support the `-k` flag for TCP, you can also use a loop:
