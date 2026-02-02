@@ -522,6 +522,95 @@ class FastestPathFinder:
         
         return True
     
+    async def _test_path(
+        self,
+        five_tuple: FiveTuple,
+        source_region: str,
+        dest_region: str,
+        test_count: int,
+        timeout: float
+    ) -> List[PathResult]:
+        """
+        Test a network path multiple times and return results.
+        
+        Args:
+            five_tuple: The 5-tuple defining the connection
+            source_region: Source AWS region
+            dest_region: Destination AWS region
+            test_count: Number of tests to run
+            timeout: Timeout per test in seconds
+            
+        Returns:
+            List of PathResult objects
+        """
+        results = []
+        
+        for _ in range(test_count):
+            latency_ms, success, error = await self.network_tester.test_connection(
+                five_tuple, timeout
+            )
+            
+            # Get actual source port used (if available from socket)
+            actual_source_port = None
+            if five_tuple.source_port:
+                actual_source_port = five_tuple.source_port
+            
+            result = PathResult(
+                source_ip=five_tuple.source_ip,
+                dest_ip=five_tuple.dest_ip,
+                source_region=source_region,
+                dest_region=dest_region,
+                five_tuple=five_tuple,
+                latency_ms=latency_ms,
+                success=success,
+                error=error,
+                actual_source_port=actual_source_port
+            )
+            results.append(result)
+        
+        return results
+    
+    async def _test_path_with_source_port(
+        self,
+        source_ip: str,
+        dest_ip: str,
+        source_port: int,
+        dest_port: int,
+        protocol: str,
+        source_region: str,
+        dest_region: str,
+        test_count: int,
+        timeout: float
+    ) -> List[PathResult]:
+        """
+        Test a network path with a specific source port multiple times.
+        
+        Args:
+            source_ip: Source IP address
+            dest_ip: Destination IP address
+            source_port: Source port to use
+            dest_port: Destination port
+            protocol: Protocol (TCP or UDP)
+            source_region: Source AWS region
+            dest_region: Destination AWS region
+            test_count: Number of tests to run
+            timeout: Timeout per test in seconds
+            
+        Returns:
+            List of PathResult objects
+        """
+        five_tuple = FiveTuple(
+            source_ip=source_ip,
+            dest_ip=dest_ip,
+            source_port=source_port,
+            dest_port=dest_port,
+            protocol=protocol.upper()
+        )
+        
+        return await self._test_path(
+            five_tuple, source_region, dest_region, test_count, timeout
+        )
+    
     def write_csv_results(self, all_results: List[PathResult], filename: str):
         """Write results to CSV file with specified format.
         
