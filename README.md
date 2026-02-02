@@ -145,19 +145,35 @@ You need a service listening on the destination host in Region Y. The applicatio
 
 #### Option A: Netcat (Simple TCP/UDP Testing)
 
+**Important**: The application makes multiple connections per port (controlled by `--test-count`, default: 5). For TCP, use the `-k` (keep listening) flag so netcat continues accepting connections after each one closes. **Note: UDP netcat does not support the `-k` flag**, so you must use a loop for UDP testing.
+
 **For TCP testing:**
 ```bash
-# On Region Y host, listen on port 8080
-nc -l -p 8080
+# On Region Y host, listen on port 8080 (Linux)
+# The -k flag keeps netcat listening after each connection closes
+nc -l -k -p 8080
 
-# Or for a specific IP interface
-nc -l -p 8080 -s <target_ip>
+# macOS syntax (no -p flag needed)
+nc -l -k 8080
+
+# Or for a specific IP interface (Linux)
+nc -l -k -p 8080 -s <target_ip>
 ```
 
 **For UDP testing:**
 ```bash
-# On Region Y host, listen on UDP port 53
-nc -u -l -p 53
+# UDP netcat does NOT support the -k flag, so use a loop instead
+# On Region Y host, listen on UDP port 53 (Linux)
+while true; do nc -u -l -p 53; done
+
+# macOS syntax
+while true; do nc -u -l 53; done
+```
+
+**Note**: If your system doesn't support the `-k` flag for TCP, you can also use a loop:
+```bash
+# Alternative for TCP on systems without -k flag
+while true; do nc -l -p 8080; done
 ```
 
 #### Option B: iperf3 (Better for Performance Testing)
@@ -368,7 +384,7 @@ Each CSV file contains all tested ports with their averaged latencies:
 
 ### Connection Refused
 - **Cause**: No service listening on destination port
-- **Fix**: Start netcat, iperf3, or other service on destination host
+- **Fix**: Start netcat with `-k` flag (see Setup section above), iperf3, or other service on destination host. Remember to use `nc -l -k -p <port>` so it accepts multiple connections.
 
 ### Timeout
 - **Cause**: Security group blocking, network unreachable, or firewall

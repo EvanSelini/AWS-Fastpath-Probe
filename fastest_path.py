@@ -857,15 +857,31 @@ Examples:
             converged_protocols: Set[str] = set()
             
             # Process ports in batches until convergence or all ports tested
-            for batch_start in range(0, len(all_available_ports), batch_size):
-                batch_ports = all_available_ports[batch_start:batch_start + batch_size]
+            # Keep track of which ports from all_available_ports we've processed
+            port_index = 0
+            
+            while port_index < len(all_available_ports):
+                # Get next batch, filtering out already-tested ports
+                batch_ports = []
+                while len(batch_ports) < batch_size and port_index < len(all_available_ports):
+                    candidate_port = all_available_ports[port_index]
+                    port_index += 1
+                    
+                    # Only add if not already tested
+                    if candidate_port not in tested_ports:
+                        batch_ports.append(candidate_port)
+                        tested_ports.add(candidate_port)
+                
+                if not batch_ports:
+                    # No new ports to test
+                    break
+                
                 round_num += 1
                 
                 print(f"   Round {round_num}: Testing batch of {len(batch_ports)} ports...")
                 
                 # Test each port with both TCP and UDP (if not converged)
                 for source_port in batch_ports:
-                    tested_ports.add(source_port)
                     
                     # Test TCP if not converged
                     if "TCP" not in converged_protocols and "TCP" in protocols:
