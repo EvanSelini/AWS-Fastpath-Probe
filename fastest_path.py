@@ -3,7 +3,7 @@
 Fastest Path Finder - AWS Region Network Path Analyzer
 
 This application finds the fastest network path between two IP addresses
-across AWS regions, considering the 5-tuple networking concept.
+across AWS regions, considering the 5-tuple networking concept
 """
 
 import argparse

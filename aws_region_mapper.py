@@ -1,7 +1,7 @@
 """
 AWS Region Mapper
 
-Maps IP addresses to AWS regions and provides region information.
+Maps IP addresses to AWS regions and provides region information
 """
 
 import asyncio
