@@ -45,12 +45,15 @@ class PathResult:
 class FastestPathFinder:
     """Main class for finding fastest paths between IPs across AWS regions."""
     
-    def __init__(self):
+    def __init__(self, port_range: Optional[Tuple[int, int]] = None):
         self.region_mapper = AWSRegionMapper()
         self.network_tester = NetworkTester()
         self.local_ip = None
         self.local_region = None
-        self.port_range = self._get_port_range()
+        if port_range:
+            self.port_range = port_range
+        else:
+            self.port_range = self._get_port_range()
     
     def _get_port_range(self) -> Tuple[int, int]:
         """Get the local port range from /proc/sys/net/ipv4/ip_local_port_range."""
@@ -99,6 +102,43 @@ class FastestPathFinder:
             self.local_ip = "unknown"
         
         return self.local_ip
+    
+    def _is_ip_configured(self, ip: str) -> bool:
+        """
+        Check if an IP address is configured on any network interface of this host.
+        
+        Args:
+            ip: IP address to check
+            
+        Returns:
+            True if IP is configured on the host, False otherwise
+        """
+        try:
+            # Try to get all network interfaces using netifaces if available
+            try:
+                import netifaces  # type: ignore
+                for interface in netifaces.interfaces():
+                    addrs = netifaces.ifaddresses(interface)
+                    if netifaces.AF_INET in addrs:
+                        for addr_info in addrs[netifaces.AF_INET]:
+                            if addr_info.get('addr') == ip:
+                                return True
+            except ImportError:
+                # netifaces not available, fall through to socket binding method
+                pass
+        except Exception:
+            # If netifaces fails, fall back to socket binding method
+            pass
+        
+        # Fallback: try to bind a socket to the IP address
+        # If we can bind to it, it's configured on the host
+        try:
+            test_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            test_sock.bind((ip, 0))
+            test_sock.close()
+            return True
+        except (OSError, socket.error):
+            return False
     
     async def _get_local_region(self) -> List[str]:
         """Get the AWS region(s) for the local machine."""
@@ -774,6 +814,12 @@ Examples:
         default=5.0,
         help="Timeout per test in seconds (default: 5.0)"
     )
+    parser.add_argument(
+        "--port-range",
+        type=str,
+        default=None,
+        help="Override source port range in format MIN-MAX (e.g., 32768-60999). Default: read from /proc/sys/net/ipv4/ip_local_port_range"
+    )
     
     args = parser.parse_args()
     
@@ -796,30 +842,45 @@ Examples:
     if not destinations:
         parser.error("At least one --destination is required")
     
-    finder = FastestPathFinder()
+    # Parse port range if provided
+    port_range = None
+    if args.port_range:
+        try:
+            min_port_str, max_port_str = args.port_range.split('-')
+            port_range = (int(min_port_str.strip()), int(max_port_str.strip()))
+            if port_range[0] >= port_range[1]:
+                parser.error("Port range MIN must be less than MAX")
+        except ValueError:
+            parser.error(f"Invalid port range format: {args.port_range}. Expected MIN-MAX (e.g., 32768-60999)")
+    
+    finder = FastestPathFinder(port_range=port_range)
     
     try:
-        # Get local region for CSV filename
-        local_regions = await finder._get_local_region()
-        source_region_str = local_regions[0] if local_regions else "unknown"
-        
         # Determine protocols to test
         if args.protocol:
             protocols = [args.protocol.upper()]
         else:
             protocols = ["TCP", "UDP"]
         
-        # Get source IP and regions
+        # Get source IP and validate it's configured on the host
         source_ip = args.source
+        
+        # Validate that the source IP is configured on this host
+        if not finder._is_ip_configured(source_ip):
+            print(f"ERROR: Source IP {source_ip} is not configured on this host!", file=sys.stderr)
+            print(f"Please ensure the IP address is assigned to a network interface.", file=sys.stderr)
+            sys.exit(1)
+        
+        # Get region for source IP (from --source argument)
         source_regions = await finder.region_mapper.get_regions_for_ip(source_ip)
         source_region = source_regions[0] if source_regions else "unknown"
+        source_region_str = source_region
         
         # Select source ports to test (only for TCP/UDP)
         all_results = []
         
-        print(f"\nTesting from local machine:")
-        print(f"   Local IP: {finder._get_local_ip()}")
-        print(f"   Local region(s): {local_regions}")
+        print(f"\nTesting from source IP: {source_ip}")
+        print(f"   Source region(s): {source_regions}")
         print(f"\nTesting to {len(destinations)} destination(s):")
         for dest_ip, dest_port in destinations:
             dest_regions = await finder.region_mapper.get_regions_for_ip(dest_ip)
@@ -1025,11 +1086,14 @@ Examples:
                 
                 # Header
                 writer.writerow([
-                    'source (ip and region)',
-                    'source port (dynamic from average of runs)',
-                    'destination (ip and region)',
-                    'destination port (static)',
-                    'protocol'
+                    'source region',
+                    'destination region',
+                    'source ip',
+                    'source port',
+                    'destination ip',
+                    'destination port',
+                    'protocol',
+                    'latency'
                 ])
                 
                 # Write rows for this protocol - one row per (source_port, destination)
@@ -1046,15 +1110,15 @@ Examples:
                     dest_regions = await finder.region_mapper.get_regions_for_ip(dest_ip)
                     dest_region = dest_regions[0] if dest_regions else "unknown"
                     
-                    source_str = f"{source_ip} ({source_region})"
-                    dest_str = f"{dest_ip} ({dest_region})"
-                    
                     writer.writerow([
-                        source_str,
+                        source_region,
+                        dest_region,
+                        source_ip,
                         source_port,
-                        dest_str,
+                        dest_ip,
                         dest_port,
-                        proto.lower()
+                        proto.lower(),
+                        f"{avg_latency:.2f}"
                     ])
             
             csv_files_written.append(csv_filename)

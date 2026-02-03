@@ -30,6 +30,7 @@ class AWSRegionMapper:
         "ap-southeast-2", # Sydney
         "ap-northeast-1", # Tokyo
         "ap-south-1",    # Mumbai
+        "ap-east-1",     # Hong Kong
         "sa-east-1",     # São Paulo
     ]
     
@@ -95,28 +96,30 @@ class AWSRegionMapper:
             except (ValueError, KeyError):
                 continue
         
-        # If no regions found, try to infer from IP geolocation or return all
+        # If no regions found, try to infer from IP geolocation
         if not regions:
-            # For demonstration, we'll return common regions
+            # For demonstration, we'll try to infer
             # In production, you might use a geolocation service
-            regions = self._infer_region_from_ip(ip)
+            inferred = self._infer_region_from_ip(ip)
+            if inferred:
+                regions = inferred
+            else:
+                # If we can't determine region, return empty list
+                # The caller should handle "unknown" region
+                return []
         
-        return list(regions) if regions else self.AWS_REGIONS
+        return list(regions)
     
     def _infer_region_from_ip(self, ip: str) -> Set[str]:
         """
         Infer likely AWS region from IP address.
         This is a simple heuristic - in production, use a proper geolocation service.
+        Note: This should only be used as a last resort when IP is not in AWS IP ranges.
         """
         # This is a placeholder - in production, use MaxMind GeoIP2 or similar
-        # For now, return a subset of regions based on common patterns
-        
-        # Private IP ranges - assume us-east-1
-        if ip.startswith(("10.", "172.16.", "192.168.")):
-            return {"us-east-1"}
-        
-        # Default to major regions
-        return {"us-east-1", "us-west-2", "eu-west-1", "ap-southeast-1"}
+        # For now, return empty set to indicate we couldn't determine region
+        # The caller should handle this appropriately
+        return set()
     
     def get_region_endpoints(self, region: str) -> List[str]:
         """Get test endpoints for a given AWS region."""

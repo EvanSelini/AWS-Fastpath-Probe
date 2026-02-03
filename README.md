@@ -63,6 +63,10 @@ python fastest_path.py --source 192.168.1.1 \
 python fastest_path.py --source 192.168.1.1 --destination 10.0.0.1:8080 \
     --test-count 10 --port-sample-size 500
 
+# Override port range
+python fastest_path.py --source 192.168.1.1 --destination 10.0.0.1:8080 \
+    --port-range 32768-60999
+
 # Convergence parameters
 python fastest_path.py --source 192.168.1.1 --destination 10.0.0.1:8080 \
     --top-k 20 --convergence-rounds 5
@@ -81,6 +85,8 @@ optional arguments:
   --protocol, -p        Protocol to use: TCP or UDP (default: tests both)
   --test-count, -n      Number of tests per source port (default: 5)
   --port-sample-size    Maximum number of source ports to test (default: 300)
+  --port-range          Override source port range in format MIN-MAX (e.g., 32768-60999).
+                        Default: read from /proc/sys/net/ipv4/ip_local_port_range
   --top-k               Number of top ports to track for convergence (default: 10)
   --convergence-rounds  Rounds with stable Top-K for convergence (default: 3)
   --convergence-threshold  Jaccard similarity threshold (default: 0.9)
@@ -122,22 +128,28 @@ The application consists of several modules:
 
 ## How It Works
 
-1. **Local Machine Detection**: Detects the local machine's IP and AWS region (where tests run from)
+1. **Source IP Validation**: Validates that the `--source` IP address is configured on the host
 2. **Region Detection**: Queries AWS IP ranges to determine which regions contain the source and destination IPs
+   - Source region is based on the `--source` IP address
+   - Destination region is based on the destination IP address
 3. **5-Tuple Generation**: Creates 5-tuple configurations based on the specified protocol and ports
-4. **Path Testing**: Tests network paths from the local machine to the destination IP concurrently
+4. **Path Testing**: Tests network paths by binding sockets to the source IP, ensuring packets go out the correct interface
 5. **Latency Measurement**: Measures connection latency for each path
 6. **Result Analysis**: Identifies the fastest successful path and displays results
 
 ## Setup: Running from Region X to Region Y
 
-### Important: Testing from Different Regions
+### Important: Source IP Requirements
 
-**Critical Note**: The application tests network paths **FROM the local machine** where the script is running **TO the destination IP**.
+**Critical Note**: The `--source` IP address **must be configured on the host** where the script is running. The script will:
+- Validate that the source IP is configured on a network interface
+- Bind sockets to the source IP to ensure packets go out the correct interface
+- Use the source IP for region detection (not auto-detected local IP)
 
 To accurately test a path from **Region X → Region Y**:
-- **You must run the script from a host located in Region X**
-- The application will detect your local machine's region and warn you if it doesn't match the specified source IP
+- **The `--source` IP must be configured on a network interface of the host**
+- **The host must be able to route traffic from that source IP to the destination**
+- The application will exit with an error if the source IP is not configured
 
 ### Step 1: Prepare Destination Host (Region Y)
 
@@ -231,24 +243,26 @@ Example: `us-east-1-192-168-1-1-tcp-fastestpath-20240115-143022.csv`
 
 The timestamp prevents overwriting previous results when running multiple times.
 
-Each CSV file contains:
-- **Source (IP and region)**: The source IP address and its detected AWS region
-- **Source port (dynamic from average of runs)**: The source port number used for testing
-- **Destination (IP and region)**: The destination IP address and its detected AWS region  
-- **Destination port (static)**: The destination port specified in the command
-- **Protocol**: The protocol used (tcp or udp, lowercase)
+Each CSV file contains the following columns:
+- **source region**: The AWS region detected for the source IP (from `--source` argument)
+- **destination region**: The AWS region detected for the destination IP
+- **source ip**: The source IP address (from `--source` argument)
+- **source port**: The source port number used for testing
+- **destination ip**: The destination IP address
+- **destination port**: The destination port specified in the command
+- **protocol**: The protocol used (tcp or udp, lowercase)
+- **latency**: Average latency in milliseconds (averaged from multiple test runs per port)
 
-**Note**: Each row represents one source port tested. The latency values shown are averaged from multiple test runs (default 5 runs per port). Only ports that were actually tested (up to convergence or sample size limit) are included in the CSV. All raw data is preserved in the CSV files.
+**Note**: Each row represents one source port tested. The latency values are averaged from multiple test runs (default 5 runs per port). Only ports that were actually tested (up to convergence or sample size limit) are included in the CSV.
 
 ### Example Output Flow
 
 ```
-Testing from local machine:
-   Local IP: 54.123.45.67
-   Local region(s): ['us-east-1']
+Testing from source IP: 10.50.1.54
+   Source region(s): ['us-east-2']
 
 Testing to 1 destination(s):
-   - 10.0.0.1:8080 (regions: ['us-west-2'])
+   - 10.181.10.197:8080 (regions: ['ap-east-1'])
 
 Protocols to test: TCP, UDP
 
@@ -278,41 +292,41 @@ Testing destination 10.0.0.1:8080...
    All protocols converged after 4 rounds!
    Completed testing 200 source ports for 10.0.0.1:8080
 
-Results written to us-east-1-54-123-45-67-tcp-fastestpath-20240115-143022.csv
-Results written to us-east-1-54-123-45-67-udp-fastestpath-20240115-143022.csv
+Results written to us-east-2-10-50-1-54-tcp-fastestpath-20240115-143022.csv
+Results written to us-east-2-10-50-1-54-udp-fastestpath-20240115-143022.csv
 
 ================================================================================
 TOP 5 LOWEST LATENCY PATHS
 ================================================================================
 
 1. TCP - Source Port 32890
-   Source:      54.123.45.67 (us-east-1)
-   Destination: 10.0.0.1 (us-west-2):8080
+   Source:      10.50.1.54 (us-east-2)
+   Destination: 10.181.10.197 (ap-east-1):8080
    Latency:     12.40 ms
 
 2. TCP - Source Port 33012
-   Source:      54.123.45.67 (us-east-1)
-   Destination: 10.0.0.1 (us-west-2):8080
+   Source:      10.50.1.54 (us-east-2)
+   Destination: 10.181.10.197 (ap-east-1):8080
    Latency:     12.58 ms
 
 3. TCP - Source Port 33134
-   Source:      54.123.45.67 (us-east-1)
-   Destination: 10.0.0.1 (us-west-2):8080
+   Source:      10.50.1.54 (us-east-2)
+   Destination: 10.181.10.197 (ap-east-1):8080
    Latency:     12.89 ms
 
 4. UDP - Source Port 32891
-   Source:      54.123.45.67 (us-east-1)
-   Destination: 10.0.0.1 (us-west-2):8080
+   Source:      10.50.1.54 (us-east-2)
+   Destination: 10.181.10.197 (ap-east-1):8080
    Latency:     15.19 ms
 
 5. TCP - Source Port 33256
-   Source:      54.123.45.67 (us-east-1)
-   Destination: 10.0.0.1 (us-west-2):8080
+   Source:      10.50.1.54 (us-east-2)
+   Destination: 10.181.10.197 (ap-east-1):8080
    Latency:     13.12 ms
 ================================================================================
 
 Completed: 2000 successful tests out of 2000 total
-CSV files written: us-east-1-54-123-45-67-tcp-fastestpath-20240115-143022.csv, us-east-1-54-123-45-67-udp-fastestpath-20240115-143022.csv
+CSV files written: us-east-2-10-50-1-54-tcp-fastestpath-20240115-143022.csv, us-east-2-10-50-1-54-udp-fastestpath-20240115-143022.csv
 ```
 
 ## How to Interpret Results
@@ -333,24 +347,26 @@ CSV files written: us-east-1-54-123-45-67-tcp-fastestpath-20240115-143022.csv, u
 
 ### 2. Region Information
 
-**Source Region**: Where the test originates (your local machine's region)
-**Destination Region**: Where the target IP is located
+**Source Region**: AWS region detected for the `--source` IP address (must be configured on the host)
+**Destination Region**: AWS region detected for the destination IP address
 
 **Example:**
 ```
-Source IP: 54.123.45.67 (us-east-1)  <- You're running from here
-Destination IP: 54.234.56.78 (eu-west-1)  <- Testing to here
-Latency: 45.23 ms  <- us-east-1 -> eu-west-1 connection time
+Source IP: 10.50.1.54 (us-east-2)  <- Source IP from --source argument
+Destination IP: 10.181.10.197 (ap-east-1)  <- Destination IP from --destination argument
+Latency: 45.23 ms  <- us-east-2 -> ap-east-1 connection time
 ```
 
 ### 3. 5-Tuple Information
 
 The result shows the complete 5-tuple used:
-- **Source IP**: Your local machine's IP
-- **Destination IP**: Target IP
-- **Source Port**: Dynamically selected from ephemeral port range
+- **Source IP**: The IP address from `--source` argument (must be configured on the host)
+- **Destination IP**: Target IP from `--destination` argument
+- **Source Port**: Dynamically selected from ephemeral port range (or `--port-range` if specified)
 - **Destination Port**: The port you specified in destination format (e.g., 8080)
 - **Protocol**: TCP or UDP
+
+**Important**: The script binds sockets to the source IP to ensure packets go out the correct network interface.
 
 ### 4. Success vs Failure
 
@@ -394,9 +410,13 @@ Each CSV file contains all tested ports with their averaged latencies:
 - **Cause**: Geographic distance, network congestion, or routing issues
 - **Fix**: Test multiple times, check for consistent patterns
 
+### Source IP Not Configured
+- **Cause**: The `--source` IP address is not configured on any network interface
+- **Fix**: Ensure the source IP is assigned to a network interface on the host. The script will exit with an error if the IP is not configured.
+
 ### Wrong Region Detected
 - **Cause**: IP not in AWS IP ranges, or private IP
-- **Fix**: Application uses heuristics - verify manually if needed
+- **Fix**: Region detection relies on AWS IP ranges. If an IP is not found in AWS ranges, the region will be "unknown". Verify manually if needed.
 
 ### Convergence Not Reached
 - **Cause**: Network conditions changing, or convergence parameters too strict
@@ -411,8 +431,8 @@ Each CSV file contains all tested ports with their averaged latencies:
 
 ## Limitations
 
-- **Tests run from local machine**: Network paths are tested from wherever the script is executed, not from the specified source IP
+- **Source IP must be configured**: The `--source` IP address must be configured on a network interface of the host running the script
+- **Socket binding**: The script binds sockets to the source IP to ensure packets use the correct interface. If binding fails, the test will fail.
 - Some UDP services may not respond, but packet send time is measured
-- Region detection relies on AWS IP ranges; private IPs use heuristics
-- For accurate cross-region testing, deploy and run the script in the source region
-- Port range file (`/proc/sys/net/ipv4/ip_local_port_range`) is Linux-specific; falls back to default range on other systems
+- Region detection relies on AWS IP ranges; if an IP is not in AWS ranges, region will be "unknown"
+- Port range file (`/proc/sys/net/ipv4/ip_local_port_range`) is Linux-specific; falls back to default range (32768-60999) on other systems, or use `--port-range` to override

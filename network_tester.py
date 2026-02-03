@@ -57,13 +57,26 @@ class NetworkTester:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(timeout)
             
-            # Bind to specific source port if provided
+            # Bind to specific source IP and port if provided
+            # This ensures packets go out the interface connected to the source IP
+            bind_addr = ''
+            if five_tuple.source_ip:
+                bind_addr = five_tuple.source_ip
+            
             if five_tuple.source_port and five_tuple.source_port != 0:
                 try:
-                    sock.bind(('', five_tuple.source_port))
-                except OSError:
-                    # Port might be in use, let OS assign
+                    sock.bind((bind_addr, five_tuple.source_port))
+                except OSError as e:
+                    # Port might be in use, or IP not configured
+                    if bind_addr:
+                        raise Exception(f"Cannot bind to source IP {bind_addr}: {e}")
                     pass
+            elif bind_addr:
+                # Bind to source IP even if no specific port
+                try:
+                    sock.bind((bind_addr, 0))
+                except OSError as e:
+                    raise Exception(f"Cannot bind to source IP {bind_addr}: {e}")
             
             # Connect
             connect_start = time.time()
@@ -104,13 +117,26 @@ class NetworkTester:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.settimeout(timeout)
             
-            # Bind to specific source port if provided
+            # Bind to specific source IP and port if provided
+            # This ensures packets go out the interface connected to the source IP
+            bind_addr = ''
+            if five_tuple.source_ip:
+                bind_addr = five_tuple.source_ip
+            
             if five_tuple.source_port and five_tuple.source_port != 0:
                 try:
-                    sock.bind(('', five_tuple.source_port))
-                except OSError:
-                    # Port might be in use, let OS assign
+                    sock.bind((bind_addr, five_tuple.source_port))
+                except OSError as e:
+                    # Port might be in use, or IP not configured
+                    if bind_addr:
+                        raise Exception(f"Cannot bind to source IP {bind_addr}: {e}")
                     pass
+            elif bind_addr:
+                # Bind to source IP even if no specific port
+                try:
+                    sock.bind((bind_addr, 0))
+                except OSError as e:
+                    raise Exception(f"Cannot bind to source IP {bind_addr}: {e}")
             
             # Send a test packet
             test_data = b"TEST"
