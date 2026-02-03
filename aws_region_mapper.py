@@ -213,7 +213,7 @@ class AWSRegionMapper:
         
         return endpoints.get(region, [])
     
-    async def find_destination_region_from_eni(self, ip: str, timeout_seconds: int = 5, stop_on_first: bool = True) -> Optional[str]:
+    async def find_destination_region_from_eni(self, ip: str, timeout_seconds: int = 5, stop_on_first: bool = True) -> Tuple[Optional[str], Optional[str]]:
         """
         Scan AWS regions to find which region contains an ENI/EC2 instance with the given private IP.
         This is the most accurate method for determining destination region.
@@ -224,11 +224,17 @@ class AWSRegionMapper:
             stop_on_first: Stop scanning as soon as a match is found
             
         Returns:
-            Region name if found, None otherwise
+            Tuple of (region_name, error_type) where:
+            - region_name: Region name if found, None otherwise
+            - error_type: "CREDENTIALS" if blocked by credentials/permissions, None otherwise
         """
         # Check cache first
         if ip in self.eni_scan_cache:
-            return self.eni_scan_cache[ip]
+            cached_result = self.eni_scan_cache[ip]
+            if isinstance(cached_result, tuple):
+                return cached_result
+            # Handle old cache format (just region string)
+            return (cached_result, None)
         
         try:
             import boto3
@@ -236,16 +242,16 @@ class AWSRegionMapper:
             from botocore.exceptions import BotoCoreError, ClientError
         except ImportError:
             # boto3 not available, skip ENI scanning
-            return None
+            return (None, None)
         
         # Check if IP is private (ENI scanning only works for private IPs)
         try:
             ip_obj = ipaddress.ip_address(ip)
             if not ip_obj.is_private:
                 # Public IPs won't be found via ENI scanning
-                return None
+                return (None, None)
         except ValueError:
-            return None
+            return (None, None)
         
         # Create boto3 session and config
         try:
@@ -257,13 +263,13 @@ class AWSRegionMapper:
             )
         except Exception:
             # No AWS credentials or boto3 not properly configured
-            return None
+            return (None, "CREDENTIALS")
         
         # Scan regions concurrently
         regions = self.COMMERCIAL_REGIONS
         
-        async def scan_region(region: str) -> Optional[str]:
-            """Scan a single region for the IP."""
+        async def scan_region(region: str) -> Tuple[Optional[str], Optional[str]]:
+            """Scan a single region for the IP. Returns (region, error_type)."""
             try:
                 # Run boto3 call in executor since it's synchronous
                 loop = asyncio.get_event_loop()
@@ -278,15 +284,27 @@ class AWSRegionMapper:
                 
                 if resp.get("NetworkInterfaces"):
                     # Found the IP in this region
-                    return region
-            except (ClientError, BotoCoreError):
-                # Permission denied or other AWS error - skip this region
-                pass
+                    return (region, None)
+            except ClientError as e:
+                error_code = e.response.get('Error', {}).get('Code', '')
+                # Check for credential/permission errors
+                if error_code in ('UnauthorizedOperation', 'AccessDenied', 'InvalidUserID.NotFound', 
+                                 'AuthFailure', 'SignatureDoesNotMatch', 'InvalidClientTokenId',
+                                 'NoCredentialsError'):
+                    return (None, "CREDENTIALS")
+                # Other AWS errors - skip this region
+                return (None, None)
+            except BotoCoreError as e:
+                # Check if it's a credential error
+                error_msg = str(e).lower()
+                if 'credentials' in error_msg or 'no credentials' in error_msg or 'authentication' in error_msg:
+                    return (None, "CREDENTIALS")
+                return (None, None)
             except Exception:
                 # Other errors - skip this region
-                pass
+                return (None, None)
             
-            return None
+            return (None, None)
         
         # Scan all regions concurrently (with limit to avoid too many concurrent requests)
         # Use semaphore to limit concurrent scans
@@ -297,24 +315,53 @@ class AWSRegionMapper:
                 return await scan_region(region)
         
         # Create tasks for all regions
-        tasks = [scan_with_limit(region) for region in regions]
+        tasks = [asyncio.create_task(scan_with_limit(region)) for region in regions]
+        
+        # Track credential errors
+        credential_errors = 0
+        total_regions_scanned = 0
         
         # Wait for results, stopping early if stop_on_first and we find a match
         if stop_on_first:
             # Use as_completed to stop as soon as we find a match
-            for coro in asyncio.as_completed(tasks):
-                result = await coro
-                if result:
-                    self.eni_scan_cache[ip] = result
-                    return result
+            try:
+                for coro in asyncio.as_completed(tasks):
+                    result, error_type = await coro
+                    total_regions_scanned += 1
+                    if error_type == "CREDENTIALS":
+                        credential_errors += 1
+                    if result:
+                        # Cancel remaining tasks to stop scanning
+                        for task in tasks:
+                            if not task.done():
+                                task.cancel()
+                        # Wait for cancellations to complete (ignore errors)
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                        self.eni_scan_cache[ip] = (result, None)
+                        return (result, None)
+            except Exception:
+                pass
         else:
             # Wait for all tasks
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for result in results:
-                if isinstance(result, str):
-                    self.eni_scan_cache[ip] = result
-                    return result
+                if isinstance(result, Exception):
+                    continue
+                if isinstance(result, tuple):
+                    region_result, error_type = result
+                    total_regions_scanned += 1
+                    if error_type == "CREDENTIALS":
+                        credential_errors += 1
+                    if region_result:
+                        self.eni_scan_cache[ip] = (region_result, None)
+                        return (region_result, None)
         
-        # Not found in any region
-        self.eni_scan_cache[ip] = None
-        return None
+        # Check if all failures were due to credentials
+        if total_regions_scanned > 0 and credential_errors == total_regions_scanned:
+            # All regions failed due to credentials
+            self.eni_scan_cache[ip] = (None, "CREDENTIALS")
+            return (None, "CREDENTIALS")
+        
+        # Not found in any region (but not due to credentials)
+        self.eni_scan_cache[ip] = (None, None)
+        return (None, None)
