@@ -6,7 +6,7 @@ Maps IP addresses to AWS regions and provides region information.
 
 import asyncio
 import ipaddress
-from typing import List, Set
+from typing import List, Set, Optional, Tuple
 import aiohttp
 
 
@@ -34,9 +34,32 @@ class AWSRegionMapper:
         "sa-east-1",     # São Paulo
     ]
     
+    # Commercial regions for ENI scanning (as of 2025)
+    COMMERCIAL_REGIONS = [
+        # US
+        "us-east-1", "us-east-2", "us-west-1", "us-west-2",
+        # Canada
+        "ca-central-1",
+        # South America
+        "sa-east-1",
+        # Europe
+        "eu-north-1", "eu-west-1", "eu-west-2", "eu-west-3",
+        "eu-central-1", "eu-south-1", "eu-south-2",
+        # Middle East
+        "me-central-1",
+        # Asia Pacific
+        "ap-northeast-1", "ap-northeast-2", "ap-northeast-3",
+        "ap-southeast-1", "ap-southeast-2", "ap-southeast-3", "ap-southeast-4",
+        "ap-south-1", "ap-south-2",
+        "ap-east-1",
+    ]
+    
     def __init__(self):
         self.ip_ranges_cache = None
         self.cache_timestamp = None
+        self.metadata_region = None
+        self.metadata_az = None
+        self.eni_scan_cache = {}  # Cache for ENI scan results: {ip: region}
     
     async def _fetch_aws_ip_ranges(self) -> dict:
         """Fetch AWS IP ranges from official source."""
@@ -58,6 +81,54 @@ class AWSRegionMapper:
             self.cache_timestamp = time.time()
         
         return self.ip_ranges_cache
+    
+    async def get_region_from_metadata(self) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Get AWS region and availability zone from instance metadata service.
+        
+        Returns:
+            Tuple of (region, availability_zone) or (None, None) if not available
+        """
+        if self.metadata_region and self.metadata_az:
+            return (self.metadata_region, self.metadata_az)
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Get availability zone
+                try:
+                    async with session.get(
+                        'http://169.254.169.254/latest/meta-data/placement/availability-zone',
+                        timeout=aiohttp.ClientTimeout(total=2)
+                    ) as response:
+                        if response.status == 200:
+                            az = await response.text()
+                            az = az.strip()
+                            # Extract region from AZ (e.g., us-east-1a -> us-east-1)
+                            # AZ format is typically region-letter (e.g., us-east-1a, us-west-2b)
+                            # Remove the trailing letter to get region
+                            if az:
+                                # Most AZs end with a single letter, but some regions have different formats
+                                # Try to extract region by removing the last character if it's a letter
+                                if len(az) > 1 and az[-1].isalpha():
+                                    region = az[:-1]
+                                else:
+                                    # Fallback: try to find region pattern
+                                    # Split by common patterns
+                                    parts = az.split('-')
+                                    if len(parts) >= 3:
+                                        region = '-'.join(parts[:3])  # e.g., us-east-1
+                                    else:
+                                        region = az
+                                
+                                self.metadata_az = az
+                                self.metadata_region = region
+                                return (region, az)
+                except (aiohttp.ClientError, asyncio.TimeoutError):
+                    pass
+        except Exception:
+            pass
+        
+        return (None, None)
     
     async def get_regions_for_ip(self, ip: str) -> List[str]:
         """
@@ -141,3 +212,109 @@ class AWSRegionMapper:
         }
         
         return endpoints.get(region, [])
+    
+    async def find_destination_region_from_eni(self, ip: str, timeout_seconds: int = 5, stop_on_first: bool = True) -> Optional[str]:
+        """
+        Scan AWS regions to find which region contains an ENI/EC2 instance with the given private IP.
+        This is the most accurate method for determining destination region.
+        
+        Args:
+            ip: Private IP address to search for
+            timeout_seconds: Per-call connect/read timeout
+            stop_on_first: Stop scanning as soon as a match is found
+            
+        Returns:
+            Region name if found, None otherwise
+        """
+        # Check cache first
+        if ip in self.eni_scan_cache:
+            return self.eni_scan_cache[ip]
+        
+        try:
+            import boto3
+            from botocore.config import Config
+            from botocore.exceptions import BotoCoreError, ClientError
+        except ImportError:
+            # boto3 not available, skip ENI scanning
+            return None
+        
+        # Check if IP is private (ENI scanning only works for private IPs)
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+            if not ip_obj.is_private:
+                # Public IPs won't be found via ENI scanning
+                return None
+        except ValueError:
+            return None
+        
+        # Create boto3 session and config
+        try:
+            session = boto3.Session()
+            cfg = Config(
+                connect_timeout=timeout_seconds,
+                read_timeout=timeout_seconds,
+                retries={"max_attempts": 2, "mode": "standard"},
+            )
+        except Exception:
+            # No AWS credentials or boto3 not properly configured
+            return None
+        
+        # Scan regions concurrently
+        regions = self.COMMERCIAL_REGIONS
+        
+        async def scan_region(region: str) -> Optional[str]:
+            """Scan a single region for the IP."""
+            try:
+                # Run boto3 call in executor since it's synchronous
+                loop = asyncio.get_event_loop()
+                ec2 = session.client("ec2", region_name=region, config=cfg)
+                
+                def describe_enis():
+                    return ec2.describe_network_interfaces(
+                        Filters=[{"Name": "addresses.private-ip-address", "Values": [ip]}]
+                    )
+                
+                resp = await loop.run_in_executor(None, describe_enis)
+                
+                if resp.get("NetworkInterfaces"):
+                    # Found the IP in this region
+                    return region
+            except (ClientError, BotoCoreError):
+                # Permission denied or other AWS error - skip this region
+                pass
+            except Exception:
+                # Other errors - skip this region
+                pass
+            
+            return None
+        
+        # Scan all regions concurrently (with limit to avoid too many concurrent requests)
+        # Use semaphore to limit concurrent scans
+        semaphore = asyncio.Semaphore(10)  # Max 10 concurrent region scans
+        
+        async def scan_with_limit(region: str):
+            async with semaphore:
+                return await scan_region(region)
+        
+        # Create tasks for all regions
+        tasks = [scan_with_limit(region) for region in regions]
+        
+        # Wait for results, stopping early if stop_on_first and we find a match
+        if stop_on_first:
+            # Use as_completed to stop as soon as we find a match
+            for coro in asyncio.as_completed(tasks):
+                result = await coro
+                if result:
+                    self.eni_scan_cache[ip] = result
+                    return result
+        else:
+            # Wait for all tasks
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, str):
+                    self.eni_scan_cache[ip] = result
+                    return result
+        
+        # Not found in any region
+        self.eni_scan_cache[ip] = None
+        return None

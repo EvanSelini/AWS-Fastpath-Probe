@@ -871,20 +871,59 @@ Examples:
             print(f"Please ensure the IP address is assigned to a network interface.", file=sys.stderr)
             sys.exit(1)
         
-        # Get region for source IP (from --source argument)
-        source_regions = await finder.region_mapper.get_regions_for_ip(source_ip)
-        source_region = source_regions[0] if source_regions else "unknown"
-        source_region_str = source_region
+        # Get region for source IP - try metadata endpoint first, then IP-based detection
+        metadata_region, metadata_az = await finder.region_mapper.get_region_from_metadata()
+        if metadata_region:
+            source_region = metadata_region
+            source_region_str = source_region
+            print(f"   Source region from metadata: {metadata_region} (AZ: {metadata_az})")
+        else:
+            # Fallback to IP-based region detection
+            source_regions = await finder.region_mapper.get_regions_for_ip(source_ip)
+            source_region = source_regions[0] if source_regions else "unknown"
+            source_region_str = source_region
+            if source_region != "unknown":
+                print(f"   Source region from IP detection: {source_region}")
+            else:
+                print(f"   Warning: Could not determine source region from metadata or IP")
         
         # Select source ports to test (only for TCP/UDP)
         all_results = []
         
         print(f"\nTesting from source IP: {source_ip}")
-        print(f"   Source region(s): {source_regions}")
+        print(f"   Source region: {source_region}")
+        print(f"\nDetermining destination regions...")
+        
+        # Determine destination regions - try ENI scanning first for private IPs
+        destination_regions = {}
+        for dest_ip, dest_port in destinations:
+            print(f"   Scanning for {dest_ip}...", end=" ", flush=True)
+            # Try ENI scanning first (most accurate for private IPs)
+            eni_region, error_type = await finder.region_mapper.find_destination_region_from_eni(dest_ip, timeout_seconds=5, stop_on_first=True)
+            if eni_region:
+                destination_regions[dest_ip] = eni_region
+                print(f"Found in region: {eni_region} (via ENI scan)")
+            elif error_type == "CREDENTIALS":
+                # Blocked by credentials/permissions
+                destination_regions[dest_ip] = "Unknown"
+                print(f"WARNING: ENI scanning blocked - missing credentials or insufficient permissions")
+                print(f"         Cannot query AWS regions to determine destination region for {dest_ip}")
+                print(f"         Region set to: Unknown")
+            else:
+                # Fallback to IP-based detection
+                dest_regions = await finder.region_mapper.get_regions_for_ip(dest_ip)
+                if dest_regions:
+                    destination_regions[dest_ip] = dest_regions[0]
+                    print(f"Detected region: {dest_regions[0]} (via IP ranges)")
+                else:
+                    destination_regions[dest_ip] = "Unknown"
+                    print(f"WARNING: Could not determine region for {dest_ip}")
+                    print(f"         Region set to: Unknown")
+        
         print(f"\nTesting to {len(destinations)} destination(s):")
         for dest_ip, dest_port in destinations:
-            dest_regions = await finder.region_mapper.get_regions_for_ip(dest_ip)
-            print(f"   - {dest_ip}:{dest_port} (regions: {dest_regions})")
+            dest_region = destination_regions.get(dest_ip, "Unknown")
+            print(f"   - {dest_ip}:{dest_port} (region: {dest_region})")
         
         print(f"\nProtocols to test: {', '.join(protocols)}")
         
@@ -894,8 +933,7 @@ Examples:
         
         # For each destination, test all protocols for each port
         for dest_ip, dest_port in destinations:
-            dest_regions = await finder.region_mapper.get_regions_for_ip(dest_ip)
-            dest_region = dest_regions[0] if dest_regions else "unknown"
+            dest_region = destination_regions.get(dest_ip, "Unknown")
             
             print(f"\nTesting destination {dest_ip}:{dest_port}...")
             
@@ -1106,9 +1144,8 @@ Examples:
                     # Calculate average latency (already averaged from test runs)
                     avg_latency = sum(latencies) / len(latencies) if latencies else 0
                     
-                    # Get destination region
-                    dest_regions = await finder.region_mapper.get_regions_for_ip(dest_ip)
-                    dest_region = dest_regions[0] if dest_regions else "unknown"
+                    # Get destination region (use pre-determined region from ENI scan or IP detection)
+                    dest_region = destination_regions.get(dest_ip, "Unknown")
                     
                     writer.writerow([
                         source_region,
@@ -1136,9 +1173,12 @@ Examples:
             if latencies:
                 avg_latency = sum(latencies) / len(latencies)
                 
-                # Get regions
-                dest_regions = await finder.region_mapper.get_regions_for_ip(dest_ip)
-                dest_region = dest_regions[0] if dest_regions else "unknown"
+                # Get regions (use pre-determined region if available)
+                dest_region = destination_regions.get(dest_ip, "Unknown")
+                if dest_region == "Unknown":
+                    # Fallback: try IP-based detection
+                    dest_regions = await finder.region_mapper.get_regions_for_ip(dest_ip)
+                    dest_region = dest_regions[0] if dest_regions else "Unknown"
                 
                 all_paths.append({
                     'source_ip': source_ip,
