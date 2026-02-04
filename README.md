@@ -129,9 +129,15 @@ The application consists of several modules:
 ## How It Works
 
 1. **Source IP Validation**: Validates that the `--source` IP address is configured on the host
-2. **Region Detection**: Queries AWS IP ranges to determine which regions contain the source and destination IPs
-   - Source region is based on the `--source` IP address
-   - Destination region is based on the destination IP address
+2. **Region Detection**: Determines AWS regions for source and destination IPs using multiple methods:
+   - **Source Region**: 
+     - First tries AWS instance metadata endpoint (169.254.169.254) to get region and availability zone
+     - Falls back to IP-based detection if metadata is unavailable
+   - **Destination Region** (determined at the very beginning):
+     - First scans all AWS regions via ENI/EC2 API to find which region contains the destination IP (most accurate for private IPs)
+     - Stops scanning as soon as the region is found
+     - Falls back to IP-based detection if ENI scanning fails or is unavailable
+     - If blocked by missing credentials/permissions, displays a warning and sets region to "Unknown"
 3. **5-Tuple Generation**: Creates 5-tuple configurations based on the specified protocol and ports
 4. **Path Testing**: Tests network paths by binding sockets to the source IP, ensuring packets go out the correct interface
 5. **Latency Measurement**: Measures connection latency for each path
@@ -258,17 +264,22 @@ Each CSV file contains the following columns:
 ### Example Output Flow
 
 ```
+   Source region from metadata: us-east-2 (AZ: us-east-2a)
+
 Testing from source IP: 10.50.1.54
-   Source region(s): ['us-east-2']
+   Source region: us-east-2
+
+Determining destination regions...
+   Scanning for 10.181.10.197... Found in region: ap-east-1 (via ENI scan)
 
 Testing to 1 destination(s):
-   - 10.181.10.197:8080 (regions: ['ap-east-1'])
+   - 10.181.10.197:8080 (region: ap-east-1)
 
 Protocols to test: TCP, UDP
 
 Testing 300 source ports (sample size: 300)
 
-Testing destination 10.0.0.1:8080...
+Testing destination 10.181.10.197:8080...
    Round 1: Testing batch of 50 ports...
       TCP Top-10 ports: [32768, 32890, 33012, ...] (showing first 5)
       TCP best median latency: 12.45 ms
@@ -290,7 +301,7 @@ Testing destination 10.0.0.1:8080...
       UDP best median latency: 15.19 ms
    UDP convergence reached after 4 rounds!
    All protocols converged after 4 rounds!
-   Completed testing 200 source ports for 10.0.0.1:8080
+   Completed testing 200 source ports for 10.181.10.197:8080
 
 Results written to us-east-2-10-50-1-54-tcp-fastestpath-20240115-143022.csv
 Results written to us-east-2-10-50-1-54-udp-fastestpath-20240115-143022.csv
@@ -347,13 +358,21 @@ CSV files written: us-east-2-10-50-1-54-tcp-fastestpath-20240115-143022.csv, us-
 
 ### 2. Region Information
 
-**Source Region**: AWS region detected for the `--source` IP address (must be configured on the host)
-**Destination Region**: AWS region detected for the destination IP address
+**Source Region**: 
+- Detected from AWS instance metadata endpoint (169.254.169.254) when running on EC2
+- Falls back to IP-based detection if metadata is unavailable
+- Based on the `--source` IP address (must be configured on the host)
+
+**Destination Region**: 
+- Detected by scanning all AWS regions via ENI/EC2 API to find which region contains the destination IP
+- Scanning stops as soon as the region is found
+- Falls back to IP-based detection if ENI scanning fails
+- If blocked by missing credentials/permissions, displays a warning and sets to "Unknown"
 
 **Example:**
 ```
-Source IP: 10.50.1.54 (us-east-2)  <- Source IP from --source argument
-Destination IP: 10.181.10.197 (ap-east-1)  <- Destination IP from --destination argument
+Source IP: 10.50.1.54 (us-east-2)  <- Detected from metadata endpoint or IP ranges
+Destination IP: 10.181.10.197 (ap-east-1)  <- Detected via ENI scanning or IP ranges
 Latency: 45.23 ms  <- us-east-2 -> ap-east-1 connection time
 ```
 
@@ -414,9 +433,19 @@ Each CSV file contains all tested ports with their averaged latencies:
 - **Cause**: The `--source` IP address is not configured on any network interface
 - **Fix**: Ensure the source IP is assigned to a network interface on the host. The script will exit with an error if the IP is not configured.
 
+### ENI Scanning Blocked (Missing Credentials)
+- **Cause**: Destination region detection via ENI scanning is blocked due to missing AWS credentials or insufficient permissions
+- **Fix**: The script will display a warning and set the destination region to "Unknown". To enable accurate destination region detection:
+  - Ensure AWS credentials are configured (via IAM role, environment variables, or credentials file)
+  - Ensure the IAM role/user has `ec2:DescribeNetworkInterfaces` permission in the regions being scanned
+  - The script will fall back to IP-based detection, which may be less accurate
+
 ### Wrong Region Detected
-- **Cause**: IP not in AWS IP ranges, or private IP
-- **Fix**: Region detection relies on AWS IP ranges. If an IP is not found in AWS ranges, the region will be "unknown". Verify manually if needed.
+- **Cause**: IP not found via ENI scanning or in AWS IP ranges
+- **Fix**: 
+  - For destination IPs: Ensure you have AWS credentials with `ec2:DescribeNetworkInterfaces` permission for accurate detection
+  - If ENI scanning fails, the script falls back to IP-based detection which may be less accurate
+  - If an IP is not found in AWS ranges, the region will be "Unknown"
 
 ### Convergence Not Reached
 - **Cause**: Network conditions changing, or convergence parameters too strict
@@ -426,13 +455,20 @@ Each CSV file contains all tested ports with their averaged latencies:
 
 - Python 3.7+
 - Internet connection (for AWS IP ranges and network testing)
-- Linux system (for `/proc/sys/net/ipv4/ip_local_port_range` access)
+- Linux system (for `/proc/sys/net/ipv4/ip_local_port_range` access, or use `--port-range` to override)
 - Appropriate network permissions for socket binding
+- **Optional but recommended**: AWS credentials with `ec2:DescribeNetworkInterfaces` permission for accurate destination region detection via ENI scanning
 
 ## Limitations
 
 - **Source IP must be configured**: The `--source` IP address must be configured on a network interface of the host running the script
 - **Socket binding**: The script binds sockets to the source IP to ensure packets use the correct interface. If binding fails, the test will fail.
+- **Destination region detection**: 
+  - ENI scanning (most accurate) requires AWS credentials with `ec2:DescribeNetworkInterfaces` permission
+  - If credentials are missing or insufficient, the script will warn and fall back to IP-based detection
+  - ENI scanning only works for private IPs; public IPs use IP-based detection
+  - Scanning stops as soon as the destination region is found
 - Some UDP services may not respond, but packet send time is measured
-- Region detection relies on AWS IP ranges; if an IP is not in AWS ranges, region will be "unknown"
+- Region detection: Source region uses metadata endpoint (when on EC2) or IP ranges; destination region uses ENI scanning (when credentials available) or IP ranges
+- If an IP is not found via any method, region will be "Unknown"
 - Port range file (`/proc/sys/net/ipv4/ip_local_port_range`) is Linux-specific; falls back to default range (32768-60999) on other systems, or use `--port-range` to override
